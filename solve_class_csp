@@ -1,0 +1,219 @@
+import math
+import pandas as pd
+from collections import defaultdict, Counter
+from ortools.sat.python import cp_model
+# Implemented with Google OR-Tools CP-SAT (ortools.sat.python.cp_model)
+
+CSV_PATH = "학급반편성CSP 문제 입력파일.csv"
+
+df = pd.read_csv(CSV_PATH, dtype=str).fillna("")
+
+df["id"] = df["id"].astype(int)
+df["sex"] = df["sex"].str.strip().str.lower()
+df["score"] = df["score"].astype(int)
+df["24년 학급"] = df["24년 학급"].str.strip()
+df["클럽"] = df["클럽"].str.strip()
+df["Leadership"] = df["Leadership"].str.strip().str.lower()
+df["Piano"] = df["Piano"].str.strip().str.lower()
+df["비등교"] = df["비등교"].str.strip().str.lower()
+df["운동선호"] = df["운동선호"].str.strip().str.lower()
+df["좋은관계"] = df["좋은관계"].str.strip()
+df["나쁜관계"] = df["나쁜관계"].str.strip()
+
+students = df["id"].tolist()
+S = len(students)
+CLASSES = list(range(6))
+
+def parse_ids(cell):
+    if not cell:
+        return []
+    cell = cell.replace(",", " ")
+    toks = [t for t in cell.split() if t.isdigit()]
+    return [int(t) for t in toks]
+
+good_rel = {row.id: parse_ids(row.좋은관계) for row in df.itertuples()}
+bad_rel  = {row.id: parse_ids(row.나쁜관계)  for row in df.itertuples()}
+
+sex = dict(zip(df.id, df.sex))
+score = dict(zip(df.id, df.score))
+prev_class = dict(zip(df.id, df["24년 학급"]))
+club = dict(zip(df.id, df["클럽"]))
+
+leader_set = set(df.loc[df["Leadership"]=="yes","id"].astype(int).tolist())
+piano_set  = set(df.loc[df["Piano"]=="yes","id"].astype(int).tolist())
+nonatt_set = set(df.loc[df["비등교"]=="yes","id"].astype(int).tolist())
+sport_set  = set(df.loc[df["운동선호"]=="yes","id"].astype(int).tolist())
+
+prev_groups = defaultdict(list)
+for sid in students:
+    prev_groups[prev_class[sid]].append(sid)
+
+total_score = sum(score[s] for s in students)
+target_score = round(total_score / len(CLASSES))
+
+male_cnt = sum(1 for s in students if sex[s]=="boy")
+female_cnt = S - male_cnt
+low_m = male_cnt // len(CLASSES)
+high_m = math.ceil(male_cnt / len(CLASSES))
+
+piano_cnt = len(piano_set)
+target_piano = (piano_cnt // len(CLASSES), math.ceil(piano_cnt / len(CLASSES)))
+
+sport_cnt = len(sport_set)
+target_sport = (sport_cnt // len(CLASSES), math.ceil(sport_cnt / len(CLASSES)))
+
+club_members = defaultdict(list)
+for sid in students:
+    if club[sid]:
+        club_members[club[sid]].append(sid)
+club_targets = {c:(len(m)//len(CLASSES), math.ceil(len(m)/len(CLASSES)))
+                for c,m in club_members.items()}
+
+m = cp_model.CpModel()
+x = {}
+for s in students:
+    for c in CLASSES:
+        x[s,c] = m.NewBoolVar(f"x_{s}_{c}")
+
+for s in students:
+    m.Add(sum(x[s,c] for c in CLASSES) == 1)
+
+size_c = {c: m.NewIntVar(33,34,f"size_{c}") for c in CLASSES}
+for c in CLASSES:
+    m.Add(sum(x[s,c] for s in students) == size_c[c])
+m.Add(sum(size_c[c] for c in CLASSES) == S)
+
+for s in students:
+    for t in bad_rel[s]:
+        if t in students and t != s:
+            for c in CLASSES:
+                m.Add(x[s,c] + x[t,c] <= 1)
+
+for s in students:
+    if s in nonatt_set and good_rel[s]:
+        helpers = [y for y in good_rel[s] if y in students and y!=s]
+        if helpers:
+            choose = {y: m.NewBoolVar(f"helpChoose_{s}_{y}") for y in helpers}
+            m.Add(sum(choose.values()) >= 1)
+            for y, ch in choose.items():
+                for c in CLASSES:
+                    m.Add(x[s,c] - x[y,c] <= 1 - ch)
+                    m.Add(x[s,c] - x[y,c] >= ch - 1)
+
+leaders = list(leader_set)
+if leaders:
+    for c in CLASSES:
+        m.Add(sum(x[s,c] for s in leaders) >= 1)
+
+for c in CLASSES:
+    males = m.NewIntVar(low_m, high_m, f"males_{c}")
+    m.Add(males == sum(x[s,c] for s in students if sex[s]=="boy"))
+
+for c in CLASSES:
+    pc = m.NewIntVar(target_piano[0], target_piano[1], f"piano_{c}")
+    m.Add(pc == sum(x[s,c] for s in piano_set))
+
+for c in CLASSES:
+    sc = m.NewIntVar(target_sport[0], target_sport[1], f"sport_{c}")
+    m.Add(sc == sum(x[s,c] for s in sport_set))
+
+for c_name, members in club_members.items():
+    low, high = club_targets[c_name]
+    for c in CLASSES:
+        cc = m.NewIntVar(low, high, f"club_{c_name}_{c}")
+        m.Add(cc == sum(x[s,c] for s in members))
+
+nonatt_cnt = len(nonatt_set)
+if nonatt_cnt > 0:
+    low_na  = nonatt_cnt // len(CLASSES)
+    high_na = math.ceil(nonatt_cnt / len(CLASSES))
+    for c in CLASSES:
+        nac = m.NewIntVar(low_na, high_na, f"nonatt_{c}")
+        m.Add(nac == sum(x[s,c] for s in nonatt_set))
+
+penalties = []
+score_sum = {}
+for c in CLASSES:
+    score_sum[c] = m.NewIntVar(0, 34*100, f"scoreSum_{c}")
+    m.Add(score_sum[c] == sum(score[s]*x[s,c] for s in students))
+    d_plus  = m.NewIntVar(0, 34*100, f"dplus_score_{c}")
+    d_minus = m.NewIntVar(0, 34*100, f"dminus_score_{c}")
+    m.Add(score_sum[c] - target_score == d_plus - d_minus)
+    penalties += [d_plus, d_minus]
+
+for L, members in prev_groups.items():
+    cap = math.ceil(len(members) / len(CLASSES))
+    for c in CLASSES:
+        cnt = m.NewIntVar(0,34,f"prev_{L}_{c}")
+        m.Add(cnt == sum(x[s,c] for s in members))
+        m.Add(cnt <= cap)
+        target = round(len(members)/len(CLASSES))
+        p = m.NewIntVar(0,34,f"p_prev_{L}_{c}")
+        q = m.NewIntVar(0,34,f"q_prev_{L}_{c}")
+        m.Add(cnt - target == p - q)
+        penalties += [p, q]
+
+m.Minimize(sum(penalties))
+
+solver = cp_model.CpSolver()
+solver.parameters.max_time_in_seconds = 60.0
+solver.parameters.num_search_workers = 8
+
+res = solver.Solve(m)
+
+if res in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+    print("Status:", "OPTIMAL" if res==cp_model.OPTIMAL else "FEASIBLE")
+    assign = {s: next(c for c in CLASSES if solver.Value(x[s,c])==1) for s in students}
+
+    for c in CLASSES:
+        members = [s for s in students if assign[s]==c]
+        males = sum(1 for s in members if sex[s]=="boy")
+        females = len(members)-males
+        pianos = sum(1 for s in members if s in piano_set)
+        sports = sum(1 for s in members if s in sport_set)
+        sc_sum = sum(score[s] for s in members)
+        leaders_here = [s for s in members if s in leader_set]
+        nonatt_here = sum(1 for s in members if s in nonatt_set)
+        print(f"\n[Class {c}] size={len(members)}  scoreSum={sc_sum}  M/F={males}/{females}  piano={pianos}  sport={sports}  nonatt={nonatt_here}  leaders={len(leaders_here)}")
+        print("members:", ", ".join(map(str, members[:60])), "..." if len(members)>60 else "")
+
+    print("\n=== 검증 리포트 ===")
+    bad_viol = []
+    for s in students:
+        for t in bad_rel[s]:
+            if t in students and t!=s and assign[s]==assign[t]:
+                bad_viol.append((s,t,assign[s]))
+    print(f"나쁜관계 위반 쌍 수: {len(bad_viol)}")
+
+    na_missed = []
+    for s in students:
+        if s in nonatt_set and good_rel[s]:
+            helpers = [y for y in good_rel[s] if y in students and y!=s]
+            if helpers and not any(assign[s]==assign[y] for y in helpers):
+                na_missed.append(s)
+    print(f"고립된 비등교 학생 수(동반 실패): {len(na_missed)}")
+
+    nonatt_by_class = [sum(1 for s in students if assign[s]==c and s in nonatt_set) for c in CLASSES]
+    if nonatt_cnt > 0:
+        print(f"반별 비등교자 수: {nonatt_by_class}  / 총합={sum(nonatt_by_class)}")
+
+    prev_dist = defaultdict(lambda: [0]*len(CLASSES))
+    for L, members in prev_groups.items():
+        for s in members:
+            prev_dist[L][assign[s]] += 1
+    worst_merge = max(max(v) for v in prev_dist.values()) if prev_dist else 0
+    print(f"전년도 재결합 최댓값(어느 한 반에 몰린 최대 인원): {worst_merge}")
+
+    import statistics
+    males_by_class = [sum(1 for s in students if assign[s]==c and sex[s]=="boy")
+                      for c in CLASSES]
+    print("반별 남학생 수:", males_by_class,
+          " / 평균=", sum(males_by_class)/len(CLASSES),
+          " / 표준편차=", round(statistics.pstdev(males_by_class),2))
+
+    out_df = df.copy()
+    out_df["배정반"] = out_df["id"].map(assign)
+    out_df.to_csv("배정결과.csv", index=False, encoding="utf-8-sig")
+    print("\n배정결과.csv 파일로 저장 완료")
+else:
+    print("No feasible solution. 제약을 완화하거나 시간 제한을 늘려보세요.")
